@@ -18,6 +18,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using UWPHook.Properties;
 using UWPHook.SteamGridDb;
+using UWPHook.SunshineStream;
 using VDFParser;
 using VDFParser.Models;
 
@@ -175,6 +176,48 @@ namespace UWPHook
             {
                 await ExportGames();
                 await RestartSteam(restartSteam);
+
+                msg = "Your apps were successfuly exported!";
+                if (!restartSteam)
+                {
+                    msg += " Please restart Steam in order to see them.";
+                }
+                else if (result)
+                {
+                    msg += " Steam has been restarted.";
+                }
+
+            }
+            catch (TaskCanceledException exception)
+            {
+                Log.Error(exception.Message);
+                msg = exception.Message;
+            }
+
+            grid.IsEnabled = true;
+            progressBar.Visibility = Visibility.Collapsed;
+
+            MessageBox.Show(msg, "UWPHook", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+
+        /// <summary>
+        /// Task responsible for triggering the export, blocks the UI, and shows a message
+        /// once the task is finished, unlocking the UI
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private async void ExportSunshineButton_Click(object sender, RoutedEventArgs e)
+        {
+            grid.IsEnabled = false;
+            progressBar.Visibility = Visibility.Visible;
+
+            bool result = false, restartSteam = true;
+            string msg = String.Empty;
+
+            try
+            {
+                await ExportSunshineGames();
+                //await RestartSteam(restartSteam);
 
                 msg = "Your apps were successfuly exported!";
                 if (!restartSteam)
@@ -510,6 +553,173 @@ namespace UWPHook
                         {
                             CopyTempGridImagesToSteamUser(user);
                         }
+
+                        RemoveTempGridImages();
+                    });
+                }
+            }
+
+            return true;
+        }
+
+
+
+        /// <summary>
+        /// Main Task to export the selected games to steam
+        /// </summary>
+        /// <param name="restartSteam"></param>
+        /// <returns></returns>
+        private async Task<bool> ExportSunshineGames()
+        {
+            string[] tags = Settings.Default.Tags.Split(',');
+            string sunshine_folder = SunshineManager.GetSunshineFolder();
+
+            if (Directory.Exists(sunshine_folder))
+            {
+                var selected_apps = Apps.Entries.Where(app => app.Selected);
+                var exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                var exeDir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
+
+                List<Task> gridImagesDownloadTasks = new List<Task>();
+                bool downloadGridImages = !String.IsNullOrEmpty(Properties.Settings.Default.SteamGridDbApiKey);
+                //To make things faster, decide icons and download grid images before looping users
+                Log.Verbose("downloadGridImages: " + (downloadGridImages));
+
+                foreach (var app in selected_apps)
+                {
+                    app.Icon = app.widestSquareIcon();
+
+                    if (downloadGridImages)
+                    {
+                        Log.Verbose("Downloading grid images for app " + app.Name);
+
+                        gridImagesDownloadTasks.Add(DownloadTempGridImages(app.Name, exePath));
+                    }
+                }
+
+                await Task.WhenAll(gridImagesDownloadTasks);
+
+                // Export the selected apps and the downloaded images to each user
+                // in the steam folder by modifying it's VDF file
+                try
+                {
+                    SunshineEntry[] shortcuts = new SunshineEntry[0];
+                    try
+                    {
+                        shortcuts = SunshineManager.ReadShortcuts();
+                    }
+                    catch (Exception ex)
+                    {
+                        //If it's a short VDF, let's just overwrite it
+                        if (ex.GetType() != typeof(VDFTooShortException))
+                        {
+                            Log.Error("Error: Program failed to load existing Steam shortcuts." + Environment.NewLine + ex.Message);
+                            throw new Exception("Error: Program failed to load existing Steam shortcuts." + Environment.NewLine + ex.Message);
+                        }
+                    }
+
+                    if (shortcuts != null)
+                    {
+                        foreach (var app in selected_apps)
+                        {
+                            try
+                            {
+
+                                app.Icon = PersistAppIcon(app);
+                                Log.Verbose("Defaulting to app.Icon for app " + app.Name);
+
+                            }
+                            catch (System.IO.IOException)
+                            {
+                                Log.Verbose("Using backup icon for app " + app.Name);
+
+                                await Task.Run(() =>
+                                {
+                                    string tmpGridDirectory = Path.GetTempPath() + "UWPHook\\tmp_grid\\";
+                                    string[] images = Directory.GetFiles(tmpGridDirectory);
+
+                                    UInt64 gameId = GenerateSteamGridAppId(app.Name, exePath);
+                                    app.Icon = PersistAppIcon(app, tmpGridDirectory + gameId + "_logo.png");
+                                });
+                            }
+
+                            VDFEntry newSteamApp = new VDFEntry()
+                            {
+                                AppName = app.Name,
+                                Exe = exePath,
+                                StartDir = exeDir,
+                                LaunchOptions = app.Aumid + " " + app.Executable,
+                                AllowDesktopConfig = 1,
+                                AllowOverlay = 1,
+                                Icon = app.Icon,
+                                Index = shortcuts.Length,
+                                IsHidden = 0,
+                                OpenVR = 0,
+                                ShortcutPath = "",
+                                Tags = tags,
+                                Devkit = 0,
+                                DevkitGameID = "",
+                                LastPlayTime = (int)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                            };
+
+                            SunshineEntry newApp = new SunshineEntry()
+                            {
+                                Name = app.Name,
+                                Cmd = exePath + " " + app.Aumid + " " + app.Executable,
+                                WorkingDir = exeDir,
+                                ImagePath = app.Icon,
+                            };
+
+                            Boolean isFound = false;
+                            for (int i = 0; i < shortcuts.Length; i++)
+                            {
+                                Log.Verbose(shortcuts[i].ToString());
+
+
+                                if (shortcuts[i].Name == app.Name)
+                                {
+                                    isFound = true;
+                                    Log.Verbose(app.Name + " already added to Steam. Updating existing shortcut.");
+                                    shortcuts[i] = newApp;
+                                }
+                            }
+
+                            if (!isFound)
+                            {
+                                //Resize this array so it fits the new entries
+                                Array.Resize(ref shortcuts, shortcuts.Length + 1);
+                                shortcuts[shortcuts.Length - 1] = newApp;
+                            }
+                        }
+
+                        try
+                        {
+                            SunshineManager.WriteShortcuts(shortcuts);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error("Error: Program failed while trying to write your Steam shortcuts" + Environment.NewLine + ex.Message);
+                            throw new Exception("Error: Program failed while trying to write your Steam shortcuts" + Environment.NewLine + ex.Message);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("Error: Program failed exporting your games:" + Environment.NewLine + ex.Message + ex.StackTrace);
+                    MessageBox.Show("Error: Program failed exporting your games:" + Environment.NewLine + ex.Message + ex.StackTrace);
+                }
+
+
+                if (gridImagesDownloadTasks.Count > 0)
+                {
+                    await Task.WhenAll(gridImagesDownloadTasks);
+
+                    await Task.Run(() =>
+                    {
+                        //foreach (var user in users)
+                        //{
+                        //    CopyTempGridImagesToSteamUser(user);
+                        //}
 
                         RemoveTempGridImages();
                     });

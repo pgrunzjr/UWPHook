@@ -109,6 +109,8 @@
     <Compile Include="SteamGridDb\GameResponse.cs" />
     <Compile Include="SteamGridDb\ImageResponse.cs" />
     <Compile Include="SteamGridDb\SteamGridDbApi.cs" />
+    <Compile Include="SunshineStream\SunshineEntry.cs" />
+    <Compile Include="SunshineStream\SunshineManager.cs" />
     <Page Include="FullScreenLauncher.xaml">
       <Generator>MSBuild:Compile</Generator>
     </Page>
